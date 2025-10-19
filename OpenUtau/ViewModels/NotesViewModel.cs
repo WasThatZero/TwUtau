@@ -18,6 +18,7 @@ using OpenUtau.Core.Util;
 using ReactiveUI;
 using ReactiveUI.Fody.Helpers;
 using Serilog;
+using SharpCompress;
 
 namespace OpenUtau.App.ViewModels {
     public class NotesRefreshEvent { }
@@ -66,6 +67,7 @@ namespace OpenUtau.App.ViewModels {
         [Reactive] public bool ShowWaveform { get; set; }
         [Reactive] public bool ShowPhoneme { get; set; }
         [Reactive] public bool ShowNoteParams { get; set; }
+        [Reactive] public bool ShowExpressions { get; set; }
         [Reactive] public bool IsSnapOn { get; set; }
         [Reactive] public string SnapDivText { get; set; }
         [Reactive] public string KeyText { get; set; }
@@ -75,6 +77,8 @@ namespace OpenUtau.App.ViewModels {
         [Reactive] public string SecondaryKey { get; set; }
         [Reactive] public double ExpTrackHeight { get; set; }
         [Reactive] public double ExpShadowOpacity { get; set; }
+        [Reactive] public double ExpHeightMin { get; set; }
+        [Reactive] public double ExpHeightMax { get; set; }
         [Reactive] public UVoicePart? Part { get; set; }
         [Reactive] public Bitmap? Avatar { get; set; }
         [Reactive] public Bitmap? Portrait { get; set; }
@@ -262,6 +266,16 @@ namespace OpenUtau.App.ViewModels {
                 Preferences.Default.ShowPhoneme = showPhoneme;
                 Preferences.Save();
             });
+            ShowExpressions = Preferences.Default.ShowExpressions;
+            this.WhenAnyValue(x => x.ShowExpressions)
+            .Subscribe(showExpressions => {
+                ExpHeightMin = showExpressions
+                    ? ViewConstants.ExpHeightMin : 0;
+                ExpHeightMax = showExpressions
+                    ? ViewConstants.ExpHeightMax : 0;
+                Preferences.Default.ShowExpressions = showExpressions;
+                Preferences.Save();
+            });
             ShowNoteParams = Preferences.Default.ShowNoteParams;
             this.WhenAnyValue(x => x.ShowNoteParams)
             .Subscribe(showNoteParams => {
@@ -424,7 +438,7 @@ namespace OpenUtau.App.ViewModels {
             int tick = PointToTick(point);
             int snappedTick = (int)Math.Floor((double)tick / snapUnit) * snapUnit;
             UNote note = project.CreateNote(tone, snappedTick,
-                useLastLength ? _lastNoteLength : IsSnapOn ? snappedTick : 15);
+                useLastLength ? _lastNoteLength : IsSnapOn ? snapUnit : 15);
             DocManager.Inst.ExecuteCmd(new AddNoteCommand(Part, note));
             return note;
         }
@@ -840,7 +854,7 @@ namespace OpenUtau.App.ViewModels {
                     DocManager.Inst.ExecuteCmd(new AddNoteCommand(Part, notes));
                     int minDurTick = Part.GetMinDurTick(Project);
                     if (Part.Duration < minDurTick) {
-                        DocManager.Inst.ExecuteCmd(new ResizePartCommand(Project, Part, minDurTick));
+                        DocManager.Inst.ExecuteCmd(new ResizePartCommand(Project, Part, minDurTick - Part.Duration, false));
                     }
                     DocManager.Inst.EndUndoGroup();
                     Selection.Select(notes);
@@ -878,18 +892,12 @@ namespace OpenUtau.App.ViewModels {
                             switch (i) {
                                 case 0:
                                     if (vm.Params[i].IsSelected) {
-                                        DocManager.Inst.ExecuteCmd(new SetPitchPointsCommand(Part, note, copyNote.pitch.Clone()));
+                                        DocManager.Inst.ExecuteCmd(new SetPitchPointsCommand(Part, note, copyNote.pitch));
                                     }
                                     break;
                                 case 1:
                                     if (vm.Params[i].IsSelected) {
-                                        DocManager.Inst.ExecuteCmd(new VibratoLengthCommand(Part, note, copyNote.vibrato.length));
-                                        DocManager.Inst.ExecuteCmd(new VibratoDepthCommand(Part, note, copyNote.vibrato.depth));
-                                        DocManager.Inst.ExecuteCmd(new VibratoPeriodCommand(Part, note, copyNote.vibrato.period));
-                                        DocManager.Inst.ExecuteCmd(new VibratoFadeInCommand(Part, note, copyNote.vibrato.@in));
-                                        DocManager.Inst.ExecuteCmd(new VibratoFadeOutCommand(Part, note, copyNote.vibrato.@out));
-                                        DocManager.Inst.ExecuteCmd(new VibratoShiftCommand(Part, note, copyNote.vibrato.shift));
-                                        DocManager.Inst.ExecuteCmd(new VibratoDriftCommand(Part, note, copyNote.vibrato.drift));
+                                        DocManager.Inst.ExecuteCmd(new SetVibratoCommand(Part, note, copyNote.vibrato));
                                     }
                                     break;
                                 default:
@@ -919,6 +927,16 @@ namespace OpenUtau.App.ViewModels {
             DocManager.Inst.StartUndoGroup();
             DocManager.Inst.ExecuteCmd(new VibratoLengthCommand(Part, note, vibrato.length == 0 ? NotePresets.Default.DefaultVibrato.VibratoLength : 0));
             DocManager.Inst.EndUndoGroup();
+        }
+
+        public void ClearPhraseCache() {
+            if (Part != null && !Selection.IsEmpty) {
+                DocManager.Inst.ExecuteCmd(new ProgressBarNotification(0, ThemeManager.GetString("progress.clearingcache")));
+                var selectedNotes = Selection.ToList();
+                var phrases = Part.renderPhrases.Where(phrase => selectedNotes.Any(note => phrase.notes.Any(rnote => rnote.position == Part.position + note.position - phrase.position && rnote.duration == note.duration)));
+                phrases.ForEach(phrase => phrase.DeleteCacheFiles());
+                DocManager.Inst.ExecuteCmd(new ProgressBarNotification(0, ThemeManager.GetString("progress.cachecleared")));
+            }
         }
 
         private void SetPlayPos(int tick, bool waitingRendering) {
@@ -1020,9 +1038,13 @@ namespace OpenUtau.App.ViewModels {
                             SelectNote(focusNote.note);
                         }
                     }
-                } else if (cmd is ValidateProjectNotification
-                    || cmd is SingersRefreshedNotification
-                    || cmd is PhonemizedNotification) {
+                } else if (cmd is ValidateProjectNotification || cmd is SingersRefreshedNotification) {
+                    if (Part != null) {
+                        LoadPortrait(Part, Project);
+                    }
+                    OnPartModified();
+                    MessageBus.Current.SendMessage(new NotesRefreshEvent());
+                } else if (cmd is PhonemizedNotification) {
                     OnPartModified();
                     MessageBus.Current.SendMessage(new NotesRefreshEvent());
                 } else if (notif is PartRenderedNotification && notif.part == Part) {
